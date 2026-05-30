@@ -100,7 +100,6 @@ endforeach()
 
 # Define the mapping of binary names to source files
 set(DEVICE_MAPPINGS
-    "libRayNeoXRMiniSDK.so:src/devices/rayneo.c"
     "libGlassSDK.so:src/devices/rokid.c"
 )
 
@@ -109,6 +108,7 @@ set(SOURCES
     src/config.c
     src/connection_pool.c
     src/curl.c
+    src/devices/rayneo.c
     src/devices/xreal.c
     src/devices.c
     src/driver.c
@@ -213,7 +213,6 @@ target_include_directories(xrDriver
 		${LIBEVDEV_INCLUDE_DIRS}
 		${JSONC_INCLUDE_DIRS}
 		${CMAKE_CURRENT_SOURCE_DIR}/include
-		${CMAKE_CURRENT_SOURCE_DIR}/modules/rayneoSDKHeaders
 		${CMAKE_CURRENT_SOURCE_DIR}/modules/xrealInterfaceLibrary/interface_lib/include
 		${LIBUSB_INCLUDE_DIRS}
 		${LIBCURL_INCLUDE_DIRS}

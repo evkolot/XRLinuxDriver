@@ -13,8 +13,9 @@
 #include <sys/time.h>
 
 #if defined(__aarch64__)
-    #define DEVICE_DRIVER_COUNT 2
+    #define DEVICE_DRIVER_COUNT 3
     const device_driver_type* device_drivers[DEVICE_DRIVER_COUNT] = {
+        &rayneo_driver,
         &xreal_driver,
         &viture_driver
     };
