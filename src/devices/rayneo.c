@@ -182,11 +182,15 @@ static imu_quat_type quat_integrate_body_rate(imu_quat_type q, imu_vec3_type ome
     return normalize_quaternion(out);
 }
 
+static imu_quat_type imu_rotation_quat_from_deg(float imu_rotation_x_deg) {
+    float half = degree_to_radian(imu_rotation_x_deg) * 0.5f;
+    return (imu_quat_type){ .w = cosf(half), .x = sinf(half), .y = 0.0f, .z = 0.0f };
+}
+
 static void filter_reset(orientation_filter_type* f, float imu_rotation_x_deg) {
     f->q = (imu_quat_type){ .w = 1.0f, .x = 0.0f, .y = 0.0f, .z = 0.0f };
     f->gyro_bias = (imu_vec3_type){ 0.0f, 0.0f, 0.0f };
-    float half = degree_to_radian(imu_rotation_x_deg) * 0.5f;
-    f->imu_rotation = (imu_quat_type){ .w = cosf(half), .x = sinf(half), .y = 0.0f, .z = 0.0f };
+    f->imu_rotation = imu_rotation_quat_from_deg(imu_rotation_x_deg);
     f->last_tick_100us = -1;
     f->last_realtime_ns = 0;
 }
@@ -247,11 +251,20 @@ static imu_quat_type filter_update(orientation_filter_type* f, imu_vec3_type acc
 // ---------------------------------------------------------------------------
 // USB helpers (caller must hold usb_mutex)
 // ---------------------------------------------------------------------------
+// Choose the interface used for IMU/control traffic. RayNeo glasses expose several USB
+// interfaces (video, audio, HID/control); the sensor + command interface uses interrupt
+// endpoints, so prefer an interface whose IN and OUT endpoints are both interrupt, and fall
+// back to the first interface that has any IN+OUT endpoint pair. Mirrors the Android reference.
 static bool rayneo_select_interface(libusb_device* dev) {
     struct libusb_config_descriptor* cfg = NULL;
     if (libusb_get_active_config_descriptor(dev, &cfg) != 0 || !cfg) return false;
 
-    bool found = false;
+    bool found = false;       // selected a preferred (interrupt IN+OUT) interface
+    bool have_fallback = false;
+    int fb_iface = -1, fb_in_max = FRAME_LEN;
+    uint8_t fb_in = 0, fb_out = 0;
+    bool fb_in_int = false, fb_out_int = false;
+
     for (uint8_t i = 0; i < cfg->bNumInterfaces && !found; i++) {
         const struct libusb_interface* iface = &cfg->interface[i];
         for (int a = 0; a < iface->num_altsetting && !found; a++) {
@@ -276,16 +289,43 @@ static bool rayneo_select_interface(libusb_device* dev) {
                 }
             }
             if (in_ep != 0 && out_ep != 0) {
-                usb_interface_num = id->bInterfaceNumber;
-                ep_in = in_ep;
-                ep_out = out_ep;
-                ep_in_is_interrupt = in_interrupt;
-                ep_out_is_interrupt = out_interrupt;
-                ep_in_max_packet = in_max;
-                found = true;
+                if (in_interrupt && out_interrupt) {
+                    usb_interface_num = id->bInterfaceNumber;
+                    ep_in = in_ep;
+                    ep_out = out_ep;
+                    ep_in_is_interrupt = true;
+                    ep_out_is_interrupt = true;
+                    ep_in_max_packet = in_max;
+                    found = true;
+                } else if (!have_fallback) {
+                    fb_iface = id->bInterfaceNumber;
+                    fb_in = in_ep;
+                    fb_out = out_ep;
+                    fb_in_int = in_interrupt;
+                    fb_out_int = out_interrupt;
+                    fb_in_max = in_max;
+                    have_fallback = true;
+                }
             }
         }
     }
+
+    if (!found && have_fallback) {
+        usb_interface_num = fb_iface;
+        ep_in = fb_in;
+        ep_out = fb_out;
+        ep_in_is_interrupt = fb_in_int;
+        ep_out_is_interrupt = fb_out_int;
+        ep_in_max_packet = fb_in_max;
+        found = true;
+    }
+
+    if (found && config()->debug_device) {
+        log_debug("RayNeo driver, selected interface %d, ep_in 0x%02x (%s), ep_out 0x%02x (%s)\n",
+                  usb_interface_num, ep_in, ep_in_is_interrupt ? "interrupt" : "bulk",
+                  ep_out, ep_out_is_interrupt ? "interrupt" : "bulk");
+    }
+
     libusb_free_config_descriptor(cfg);
     return found;
 }
@@ -317,21 +357,30 @@ static bool rayneo_open_usb(uint8_t usb_bus, uint8_t usb_address) {
     }
 
     bool ok = false;
-    if (target != NULL && libusb_open(target, &usb_handle) == 0 && usb_handle) {
-        if (rayneo_select_interface(libusb_get_device(usb_handle))) {
+    if (target == NULL) {
+        log_error("RayNeo driver, device 0x%04x:0x%04x not found on the USB bus\n",
+                  RAYNEO_ID_VENDOR, RAYNEO_ID_PRODUCT);
+    } else {
+        int rc = libusb_open(target, &usb_handle);
+        if (rc != 0 || !usb_handle) {
+            log_error("RayNeo driver, failed to open USB device: %s\n", libusb_error_name(rc));
+            usb_handle = NULL;
+        } else if (rayneo_select_interface(libusb_get_device(usb_handle))) {
             libusb_set_auto_detach_kernel_driver(usb_handle, 1);
             if (libusb_kernel_driver_active(usb_handle, usb_interface_num) == 1) {
                 libusb_detach_kernel_driver(usb_handle, usb_interface_num);
             }
-            if (libusb_claim_interface(usb_handle, usb_interface_num) == 0) {
+            int crc = libusb_claim_interface(usb_handle, usb_interface_num);
+            if (crc == 0) {
                 ok = true;
             } else {
-                log_error("RayNeo driver, failed to claim USB interface\n");
+                log_error("RayNeo driver, failed to claim USB interface %d: %s\n",
+                          usb_interface_num, libusb_error_name(crc));
             }
         } else {
-            log_error("RayNeo driver, could not find IN/OUT endpoints\n");
+            log_error("RayNeo driver, could not find usable IN/OUT endpoints\n");
         }
-        if (!ok) {
+        if (!ok && usb_handle) {
             libusb_close(usb_handle);
             usb_handle = NULL;
             usb_interface_num = -1;
@@ -491,14 +540,16 @@ device_properties_type* rayneo_supported_device(uint16_t vendor_id, uint16_t pro
     // trying to connect to the device too quickly seems to cause connection issues
     sleep(2);
 
-    // Open early and request device info so we can report the correct model and pick up the
-    // IMU mounting correction before the IMU stream begins.
+    // Best-effort: open early and request device info so we can report the correct model and pick
+    // up the IMU mounting correction before the IMU stream begins. This must NOT gate detection -
+    // if the open or handshake fails here, we still report the device as supported and let the
+    // normal connect/retry path (and its logging) take over.
     pthread_mutex_lock(&usb_mutex);
     if (!hard_connected) hard_connected = rayneo_open_usb(usb_bus, usb_address);
     bool got_info = false;
     if (hard_connected && rayneo_send(CMD_ACQUIRE_DEVICE_INFO, 0)) {
         uint8_t buf[512];
-        int64_t deadline = monotonic_ns() + 2000000000LL;
+        int64_t deadline = monotonic_ns() + 1500000000LL;
         while (!got_info && monotonic_ns() < deadline) {
             int n = rayneo_read_frame(buf, sizeof(buf), 200);
             if (n < 0) break;
@@ -510,15 +561,12 @@ device_properties_type* rayneo_supported_device(uint16_t vendor_id, uint16_t pro
     }
     pthread_mutex_unlock(&usb_mutex);
 
-    if (!hard_connected) {
-        free(device);
-        return NULL;
-    }
-
     if (got_info) {
         device->model = (device_board_id == BOARD_AIR_4_PRO) ? "Air 4 Pro" : "Air 3S Pro";
         if (config()->debug_device)
             log_debug("RayNeo driver, board id 0x%02X, sbs=%d\n", device_board_id, is_sbs_mode);
+    } else {
+        log_message("RayNeo driver, device detected but device info not yet read; will connect and retry\n");
     }
 
     // Leave the connection open if we think it'll be used, but if the driver is disabled, disconnect now
@@ -547,7 +595,11 @@ void rayneo_block_on_device() {
             if (buf[1] == FRAME_TYPE_SENSOR) {
                 handle_sensor_frame(buf);
             } else if (buf[1] == FRAME_TYPE_RESPONSE) {
+                uint8_t prev_board = device_board_id;
                 apply_device_info(buf);
+                // if we only learned the board id now (not during detection), apply its IMU tilt
+                if (device_board_id != prev_board)
+                    filter.imu_rotation = imu_rotation_quat_from_deg(device_imu_rotation_x_deg);
             }
         }
 
